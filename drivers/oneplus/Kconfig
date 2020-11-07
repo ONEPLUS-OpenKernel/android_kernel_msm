@@ -1,0 +1,10 @@
+menuconfig ONEPLUS
+	bool "ONEPLUS device specific drivers"
+	default n
+
+if ONEPLUS
+
+source "drivers/oneplus/kernel/Kconfig"
+source "drivers/oneplus/misc/Kconfig"
+
+endif # ONEPLUS
