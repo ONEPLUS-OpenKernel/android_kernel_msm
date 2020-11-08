@@ -98,6 +98,9 @@ static void power_supply_changed_work(struct work_struct *work)
 		power_supply_update_leds(psy);
 		atomic_notifier_call_chain(&power_supply_notifier,
 				PSY_EVENT_PROP_CHANGED, psy);
+#ifdef CONFIG_F2FS_OF2FS
+		f2fs_battery_notifier_call_chain(PSY_EVENT_PROP_CHANGED, psy);
+#endif
 		kobject_uevent(&psy->dev.kobj, KOBJ_CHANGE);
 		spin_lock_irqsave(&psy->changed_lock, flags);
 	}

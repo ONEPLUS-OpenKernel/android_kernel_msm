@@ -55,12 +55,28 @@
 	ipc_log_string(_mtp_ipc_log, "%s: " fmt,  __func__, ##__VA_ARGS__)
 #endif
 
+static bool mtp_receive_flag;
+
 #define MTP_RX_BUFFER_INIT_SIZE    1048576
 #define MTP_TX_BUFFER_INIT_SIZE    1048576
 #define MTP_BULK_BUFFER_SIZE       16384
 #define INTR_BUFFER_SIZE           28
 #define MAX_INST_NAME_LEN          40
 #define MTP_MAX_FILE_SIZE          0xFFFFFFFFL
+
+/* @bsp, 2019/09/18 usb & PD porting */
+/* OP fix device crash when setting MTP as usb mode use fixed memory */
+#define MTP_TX_BUFFER_BASE         0xCC300000
+#define MTP_RX_BUFFER_BASE         0xCCB00000
+#define MTP_INTR_BUFFER_BASE       0xCCD00000
+
+static int mtpBufferOffset;
+static bool useFixAddr;
+enum buf_type {
+	TX_BUFFER = 0,
+	RX_BUFFER,
+	INTR_BUFFER,
+};
 
 /* String IDs */
 #define INTERFACE_STRING_INDEX	0
@@ -400,7 +416,10 @@ static inline struct mtp_dev *func_to_mtp(struct usb_function *f)
 	return container_of(f, struct mtp_dev, function);
 }
 
-static struct usb_request *mtp_request_new(struct usb_ep *ep, int buffer_size)
+/* OP fix device crash when setting MTP as usb mode use fixed memory */
+static struct usb_request *mtp_request_new(struct usb_ep *ep,
+		int buffer_size, enum buf_type type)
+
 {
 	struct usb_request *req = usb_ep_alloc_request(ep, GFP_KERNEL);
 
@@ -408,10 +427,26 @@ static struct usb_request *mtp_request_new(struct usb_ep *ep, int buffer_size)
 		return NULL;
 
 	/* now allocate buffers for the requests */
-	req->buf = kmalloc(buffer_size, GFP_KERNEL);
+	if (useFixAddr) {
+		if (type == TX_BUFFER)
+			req->buf = __va(MTP_TX_BUFFER_BASE + mtpBufferOffset);
+		else if (type == RX_BUFFER)
+			req->buf = __va(MTP_RX_BUFFER_BASE + mtpBufferOffset);
+		else
+			req->buf = __va(MTP_INTR_BUFFER_BASE + mtpBufferOffset);
+	} else
+		req->buf = kmalloc(buffer_size, GFP_KERNEL);
+	memset(req->buf, 0, buffer_size);
 	if (!req->buf) {
 		usb_ep_free_request(ep, req);
 		return NULL;
+	}
+
+	if (useFixAddr) {
+		if (buffer_size == INTR_BUFFER_SIZE)
+			mtpBufferOffset += 0x40; /* alignment */
+		else
+			mtpBufferOffset += buffer_size;
 	}
 
 	return req;
@@ -420,7 +455,15 @@ static struct usb_request *mtp_request_new(struct usb_ep *ep, int buffer_size)
 static void mtp_request_free(struct usb_request *req, struct usb_ep *ep)
 {
 	if (req) {
-		kfree(req->buf);
+		/*
+		 * OP fix device crash when setting MTP as usb mode
+		 * use fixed memory
+		 */
+		if (useFixAddr) {
+			req->buf = NULL;
+			mtpBufferOffset = 0;
+		} else
+			kfree(req->buf);
 		usb_ep_free_request(ep, req);
 	}
 }
@@ -499,6 +542,7 @@ static void mtp_complete_intr(struct usb_ep *ep, struct usb_request *req)
 	if (req->status != 0 && dev->state != STATE_OFFLINE)
 		dev->state = STATE_ERROR;
 
+	mtp_log("sent event, put back request\n");
 	mtp_req_put(dev, &dev->intr_idle, req);
 
 	wake_up(&dev->intr_wq);
@@ -544,9 +588,24 @@ static int mtp_create_bulk_endpoints(struct mtp_dev *dev,
 	dev->ep_intr = ep;
 
 retry_tx_alloc:
+	/* OP fix device crash when setting MTP as usb mode use fixed memory */
+	if (mtp_tx_req_len == MTP_TX_BUFFER_INIT_SIZE
+		&& mtp_rx_req_len == MTP_RX_BUFFER_INIT_SIZE
+		&& mtp_tx_reqs == MTP_TX_REQ_MAX)
+		useFixAddr = true;
+	else
+		useFixAddr = false;
+	pr_info("useFixAddr:%s\n", useFixAddr ? "true" : "false");
+	mtpBufferOffset = 0;
+
 	/* now allocate requests for our endpoints */
 	for (i = 0; i < mtp_tx_reqs; i++) {
-		req = mtp_request_new(dev->ep_in, mtp_tx_req_len);
+		/*
+		 * OP fix device crash when setting MTP as usb mode
+		 * use fixed memory
+		 */
+		req = mtp_request_new(dev->ep_in,
+				mtp_tx_req_len, TX_BUFFER);
 		if (!req) {
 			if (mtp_tx_req_len <= MTP_BULK_BUFFER_SIZE)
 				goto fail;
@@ -570,8 +629,11 @@ retry_tx_alloc:
 		mtp_rx_req_len = MTP_BULK_BUFFER_SIZE;
 
 retry_rx_alloc:
+	/* OP fix device crash when setting MTP as usb mode use fixed memory */
+	mtpBufferOffset = 0;
 	for (i = 0; i < RX_REQ_MAX; i++) {
-		req = mtp_request_new(dev->ep_out, mtp_rx_req_len);
+		req = mtp_request_new(dev->ep_out,
+				mtp_rx_req_len, RX_BUFFER);
 		if (!req) {
 			if (mtp_rx_req_len <= MTP_BULK_BUFFER_SIZE)
 				goto fail;
@@ -583,13 +645,17 @@ retry_rx_alloc:
 		req->complete = mtp_complete_out;
 		dev->rx_req[i] = req;
 	}
+	/* OP fix device crash when setting MTP as usb mode use fixed memory */
+	mtpBufferOffset = 0;
 	for (i = 0; i < INTR_REQ_MAX; i++) {
-		req = mtp_request_new(dev->ep_intr, INTR_BUFFER_SIZE);
+		req = mtp_request_new(dev->ep_intr,
+			INTR_BUFFER_SIZE, INTR_BUFFER);
 		if (!req)
 			goto fail;
 		req->complete = mtp_complete_intr;
 		mtp_req_put(dev, &dev->intr_idle, req);
 	}
+	mtpBufferOffset = 0;
 
 	return 0;
 
@@ -692,8 +758,11 @@ requeue_req:
 		mtp_log("rx %pK %d\n", req, req->actual);
 		xfer = (req->actual < count) ? req->actual : count;
 		r = xfer;
-		if (copy_to_user(buf, req->buf, xfer))
-			r = -EFAULT;
+		if (dev->ep_out->enabled) {
+			if (copy_to_user(buf, req->buf, xfer))
+				r = -EFAULT;
+		} else
+			r = -EIO;
 	} else
 		r = -EIO;
 
@@ -943,6 +1012,7 @@ static void receive_file_work(struct work_struct *data)
 	if (!IS_ALIGNED(count, dev->ep_out->maxpacket))
 		mtp_log("- count(%lld) not multiple of mtu(%d)\n",
 						count, dev->ep_out->maxpacket);
+
 	mutex_lock(&dev->read_mutex);
 	if (dev->state == STATE_OFFLINE) {
 		r = -EIO;
@@ -1032,6 +1102,7 @@ static void receive_file_work(struct work_struct *data)
 	}
 fail:
 	mutex_unlock(&dev->read_mutex);
+
 	mtp_log("returning %d\n", r);
 	/* write the result */
 	dev->xfer_result = r;
@@ -1053,7 +1124,7 @@ static int mtp_send_event(struct mtp_dev *dev, struct mtp_event *event)
 
 	ret = wait_event_interruptible_timeout(dev->intr_wq,
 			(req = mtp_req_get(dev, &dev->intr_idle)),
-			msecs_to_jiffies(1000));
+			msecs_to_jiffies(32));
 	if (!req)
 		return -ETIME;
 
@@ -1122,20 +1193,24 @@ static long mtp_send_receive_ioctl(struct file *fp, unsigned int code,
 		dev->xfer_send_header = 0;
 	} else {
 		work = &dev->receive_file_work;
+		mtp_receive_flag = true;
 	}
 
 	/* We do the file transfer on a work queue so it will run
 	 * in kernel context, which is necessary for vfs_read and
 	 * vfs_write to use our buffers in the kernel address space.
 	 */
+	dev->xfer_result = 0;
 	queue_work(dev->wq, work);
 	/* wait for operation to complete */
 	flush_workqueue(dev->wq);
-	fput(filp);
-
+	if (mtp_receive_flag) {
+		mtp_receive_flag = false;
+	}
 	/* read the result */
 	smp_rmb();
 	ret = dev->xfer_result;
+	fput(filp);
 
 fail:
 	spin_lock_irq(&dev->lock);
@@ -1277,6 +1352,9 @@ static int mtp_release(struct inode *ip, struct file *fp)
 {
 	printk(KERN_INFO "mtp_release\n");
 
+	if (mtp_receive_flag) {
+		mtp_receive_flag = false;
+	}
 	mtp_unlock(&_mtp_dev->open_excl);
 	return 0;
 }
@@ -1855,6 +1933,11 @@ static int mtp_ctrlreq_configfs(struct usb_function *f,
 static void mtp_free(struct usb_function *f)
 {
 	/*NO-OP: no function specific resource allocation in mtp_alloc*/
+/* @bsp, 2019/09/18 usb & PD porting */
+	struct mtp_instance *fi_mtp;
+
+	fi_mtp = container_of(f->fi, struct mtp_instance, func_inst);
+	fi_mtp->func_inst.f = NULL;
 }
 
 struct usb_function *function_alloc_mtp_ptp(struct usb_function_instance *fi,
